@@ -1,9 +1,10 @@
 from rest_framework import viewsets, status, generics
-from rest_framework.decorators import action
+from rest_framework.decorators import action, api_view, parser_classes
 from rest_framework.response import Response
-from rest_framework.parsers import MultiPartParser, FormParser
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from django.shortcuts import get_object_or_404
 import json
+import logging
 
 from .models import Course, Objective, Module, Scene, KnowledgeCheck, Question, Option, Avatar, CourseAvatar
 from .serializers import (
@@ -13,37 +14,37 @@ from .serializers import (
 )
 from .openai_utils import (
     generate_course_objectives, generate_module_description, 
-    generate_video_script, generate_knowledge_check
+    generate_video_script, generate_knowledge_check, generate_search_query_for_visuals
 )
+# Import the updated search function that handles used URLs
+from .video_utils import search_and_evaluate_pexels_videos 
+from .tts_utils import generate_tts_for_scene
+
+logger = logging.getLogger(__name__)
 
 class CourseViewSet(viewsets.ModelViewSet):
     """ViewSet for managing Courses"""
     queryset = Course.objects.all()
     serializer_class = CourseSerializer
-    parser_classes = (MultiPartParser, FormParser) # To handle file uploads
+    parser_classes = (MultiPartParser, FormParser, JSONParser)
 
     def get_serializer_class(self):
-        if self.action == 'create':
+        if self.action == "create":
             return CourseCreateSerializer
         return CourseSerializer
 
     def perform_create(self, serializer):
         """Handle Step 1: Create Course and Generate Objectives"""
-        # Save the initial course data
         course = serializer.save()
-        
-        # Read document content if provided
         document_content = None
         if course.documents:
             try:
+                # TODO: Handle different file types properly
                 with course.documents.open("r") as f:
-                    # TODO: Handle different file types (pdf, docx etc.) - currently assumes text
                     document_content = f.read()
             except Exception as e:
-                # Log error, but continue without document content
-                print(f"Error reading document {course.documents.name}: {e}")
+                logger.error(f"Error reading document {course.documents.name}: {e}")
 
-        # Generate objectives using OpenAI
         objectives_text = generate_course_objectives(
             course_name=course.name,
             language=course.language,
@@ -52,38 +53,27 @@ class CourseViewSet(viewsets.ModelViewSet):
             documents=document_content
         )
 
-        # Create Objective instances
         for i, text in enumerate(objectives_text):
             if not text.startswith("Error:"):
                 Objective.objects.create(course=course, text=text, order=i)
             else:
-                # Handle potential error during objective generation (e.g., log it)
-                print(f"Error generating objective {i+1} for course {course.id}: {text}")
-                # Optionally, create a placeholder objective or raise an error
+                logger.error(f"Error generating objective {i+1} for course {course.id}: {text}")
 
-        # Associate the generated objectives back to the serializer instance for the response
-        # We need to re-fetch the course to include the objectives in the response
         self.instance = Course.objects.get(pk=course.pk)
         serializer = self.get_serializer(self.instance)
-        # Override the response data with the full CourseSerializer including objectives
         self.headers = self.get_success_headers(serializer.data)
-        # Manually set the response data because perform_create doesn't return it directly
-        # This is a bit hacky, might need refinement depending on DRF version/patterns
-        # A better way might be to override the create method entirely.
 
-    # Override create to return the full CourseSerializer data
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         self.perform_create(serializer)
-        # Use the serializer instance updated in perform_create
         updated_serializer = self.get_serializer(self.instance)
         headers = self.get_success_headers(updated_serializer.data)
         return Response(updated_serializer.data, status=status.HTTP_201_CREATED, headers=headers)
 
-    @action(detail=True, methods=["post"], url_path=\"generate-modules\")
+    @action(detail=True, methods=["post"], url_path="generate-modules")
     def generate_modules(self, request, pk=None):
-        """Handle Step 2: Generate Modules and Video Content based on selected Objectives"""
+        """Handle Step 2: Generate Modules, Video Content, Find Unique Visuals, and Generate TTS"""
         course = self.get_object()
         selected_objectives = course.objectives.filter(selected=True).order_by("order")
 
@@ -97,52 +87,98 @@ class CourseViewSet(viewsets.ModelViewSet):
             "content_style": course.content_style
         }
 
+        # Process each selected objective to create a module
         for i, objective in enumerate(selected_objectives):
-            # Generate Module Description
             module_description = generate_module_description(objective.text, course_context)
             if module_description.startswith("Error:"):
-                # Handle error
-                print(f"Error generating description for objective {objective.id}: {module_description}")
-                continue # Skip this module
+                logger.error(f"Error generating description for objective {objective.id}: {module_description}")
+                continue # Skip this module if description fails
             
             module, created = Module.objects.update_or_create(
                 objective=objective,
                 defaults={
                     "course": course,
-                    "title": f"Module {i+1}: {objective.text[:50]}...", # Generate a better title?
+                    "title": f"Module {i+1}: {objective.text[:50]}...",
                     "description": module_description,
                     "order": i
                 }
             )
 
-            # Generate Video Script and Scenes
             script_data = generate_video_script(module.description, course_context)
             if "error" in script_data:
-                # Handle error
-                print(f"Error generating script for module {module.id}: {script_data["error"]}")
-                continue # Skip scenes for this module
+                logger.error(f"Error generating script for module {module.id}: {script_data["error"]}")
+                continue # Skip scene generation if script fails
             
             # Clear existing scenes before adding new ones
             module.scenes.all().delete()
             
+            # --- Track used background video URLs for this specific module --- 
+            used_background_urls_for_module = set()
+            
+            # Process each scene within the module
             for scene_data in script_data.get("scenes", []):
-                Scene.objects.create(
-                    module=module,
-                    scene_number=int(scene_data.get("scene_number", "SCENE 0").split(" ")[-1]),
-                    visual_description=scene_data.get("visual", ""),
-                    on_screen_text=scene_data.get("text", ""),
-                    voiceover_text=scene_data.get("voiceover", "")
-                    # background_video_url and voiceover_audio_file will be populated later
-                )
+                scene_text_for_context = scene_data.get("voiceover", "") or scene_data.get("text", "")
+                visual_description = scene_data.get("visual", "")
+                scene_number_str = scene_data.get("scene_number", "SCENE 0").split(" ")[-1]
+                try:
+                    scene_number = int(scene_number_str)
+                except ValueError:
+                    logger.warning(f"Could not parse scene number 	'{scene_number_str}	'. Defaulting to 0.")
+                    scene_number = 0
 
-        serializer = self.get_serializer(course)
+                # Generate search query for visuals
+                search_query = generate_search_query_for_visuals(scene_text_for_context, visual_description)
+                logger.info(f"Generated search query 	'{search_query}	' for Module {module.order+1}, Scene {scene_number}")
+                
+                # Search and evaluate background video, avoiding used URLs
+                best_video_url = None
+                if search_query and not search_query.startswith("Error:"):
+                    best_video_url = search_and_evaluate_pexels_videos(
+                        query=search_query,
+                        scene_text=scene_text_for_context,
+                        used_urls=used_background_urls_for_module # Pass the set of used URLs
+                        # Default candidate/page limits from video_utils will be used
+                    )
+                else:
+                    logger.warning(f"Skipping visual search for Module {module.order+1}, Scene {scene_number} due to invalid search query.")
+
+                # Create Scene object
+                scene = Scene.objects.create(
+                    module=module,
+                    scene_number=scene_number,
+                    visual_description=visual_description,
+                    on_screen_text=scene_data.get("text", ""),
+                    voiceover_text=scene_data.get("voiceover", ""),
+                    background_video_url=best_video_url # Store the selected (potentially unique) video URL
+                )
+                
+                # --- Add the selected URL to the set for this module if found --- 
+                if best_video_url:
+                    used_background_urls_for_module.add(best_video_url)
+                    logger.info(f"Added {best_video_url} to used URLs for Module {module.order+1}")
+                else:
+                    logger.warning(f"No unique background video found for Module {module.order+1}, Scene {scene_number}. Background will be empty.")
+
+                # Generate TTS for the scene (consider making this asynchronous)
+                try:
+                    # Assuming generate_tts_for_scene is updated or works correctly
+                    tts_result = generate_tts_for_scene(scene.id)
+                    if not tts_result.get("success"):
+                        logger.error(f"TTS generation failed for scene {scene.id}: {tts_result.get("error")}")
+                    else:
+                        logger.info(f"TTS generated successfully for scene {scene.id}")
+                except Exception as tts_err:
+                     logger.error(f"Error calling TTS generation for scene {scene.id}: {tts_err}")
+
+        # End of loop for scenes in a module
+        # End of loop for objectives/modules
+
+        serializer = self.get_serializer(course) # Return the updated course data
         return Response(serializer.data)
 
-    @action(detail=True, methods=["patch"], serializer_class=ObjectiveSerializer, url_path=\"select-objectives\")
+    @action(detail=True, methods=["patch"], serializer_class=ObjectiveSerializer, url_path="select-objectives")
     def select_objectives(self, request, pk=None):
-        """Allows updating the 'selected' status of objectives for a course."""
         course = self.get_object()
-        # Expecting data like: [{ "id": "uuid", "selected": true }, ...]
         objective_updates = request.data
         if not isinstance(objective_updates, list):
             return Response({"error": "Expected a list of objective updates."}, status=status.HTTP_400_BAD_REQUEST)
@@ -172,13 +208,11 @@ class CourseViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
 
 class ModuleViewSet(viewsets.ReadOnlyModelViewSet):
-    """Read-only ViewSet for Modules (retrieved via Course)"""
     queryset = Module.objects.all()
     serializer_class = ModuleSerializer
 
-    @action(detail=True, methods=["post"], url_path=\"generate-knowledge-check\")
+    @action(detail=True, methods=["post"], url_path="generate-knowledge-check")
     def generate_knowledge_check(self, request, pk=None):
-        """Generate a knowledge check for a specific module"""
         module = self.get_object()
         course = module.course
         course_context = {
@@ -188,28 +222,24 @@ class ModuleViewSet(viewsets.ReadOnlyModelViewSet):
             "content_style": course.content_style
         }
 
-        # Check if knowledge check already exists
-        if hasattr(module, 'knowledge_check'):
+        if hasattr(module, "knowledge_check"):
             return Response({"error": "Knowledge check already exists for this module."}, status=status.HTTP_400_BAD_REQUEST)
 
         quiz_data_str = generate_knowledge_check(module.description, course_context)
         
         try:
-            quiz_data = json.loads(quiz_data_str) # OpenAI should return JSON
+            quiz_data = json.loads(quiz_data_str)
         except json.JSONDecodeError:
-             # Handle case where OpenAI didn't return valid JSON
              return Response({"error": "Failed to parse knowledge check data from AI.", "raw_output": quiz_data_str}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
         if "error" in quiz_data:
             return Response({"error": f"Failed to generate knowledge check: {quiz_data['error']}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-        # Create KnowledgeCheck
         knowledge_check = KnowledgeCheck.objects.create(
             module=module,
             title=f"Knowledge Check for {module.title}"
         )
 
-        # Create Questions and Options
         for i, q_data in enumerate(quiz_data.get("questions", [])):
             question = Question.objects.create(
                 knowledge_check=knowledge_check,
@@ -219,7 +249,6 @@ class ModuleViewSet(viewsets.ReadOnlyModelViewSet):
             )
             correct_answer_letter = q_data.get("correct_answer", "A").upper()
             for j, opt_text in enumerate(q_data.get("options", [])):
-                # Option text might be like "A. Answer text"
                 letter = chr(ord("A") + j)
                 text_only = opt_text.split(".", 1)[-1].strip() if len(opt_text) > 2 and opt_text[1] == "." else opt_text
                 Option.objects.create(
@@ -229,25 +258,21 @@ class ModuleViewSet(viewsets.ReadOnlyModelViewSet):
                     order=j
                 )
 
-        serializer = ModuleSerializer(module) # Return the updated module
+        serializer = ModuleSerializer(module)
         return Response(serializer.data)
 
 class AvatarViewSet(viewsets.ModelViewSet):
-    """ViewSet for managing Avatars"""
     queryset = Avatar.objects.all()
     serializer_class = AvatarSerializer
     parser_classes = (MultiPartParser, FormParser)
-    # Add permissions later (e.g., IsAuthenticated)
 
 class CourseAvatarView(generics.RetrieveUpdateAPIView):
-    """API View for setting/getting the avatar for a specific course"""
     serializer_class = CourseAvatarSerializer
     queryset = CourseAvatar.objects.all()
-    lookup_field = 'course_id'
-    lookup_url_kwarg = 'course_pk' # Match the URL pattern
+    lookup_field = "course_id"
+    lookup_url_kwarg = "course_pk"
 
     def get_object(self):
-        """Get or create the CourseAvatar instance for the given course_id"""
         course_id = self.kwargs[self.lookup_url_kwarg]
         course = get_object_or_404(Course, pk=course_id)
         obj, created = CourseAvatar.objects.get_or_create(course=course)
